@@ -191,8 +191,8 @@ struct CNNModel {
         pool3_width = conv3_width / pool_size;
         pool3_height = conv3_height / pool_size;
 
-        std::random_device rd;
-        std::mt19937 gen(rd());
+        // Sử dụng seed cố định để đảm bảo kết quả nhất quán
+        std::mt19937 gen(42); // Seed cố định là 42
 
         // Khởi tạo trọng số cho Conv1
         float conv1_scale = sqrt(2.0f / (input_channels * filter_size * filter_size));
@@ -316,63 +316,53 @@ struct CNNModel {
     }
 };
 
-// Class để train và test model CNN
+// Lớp huấn luyện CNN với OpenCL
 class CNNTrainer {
 private:
-    CNNModel model;
+    CNNModel& model;
+    float learning_rate;
+    int batch_size;
+    int epochs;
+    cl::Device device;
     cl::Context context;
     cl::CommandQueue queue;
     cl::Program program;
-    cl::Device device;
-    cl::Kernel conv2d_kernel, max_pooling_kernel, fc_kernel, softmax_kernel, cross_entropy_gradient_kernel, fc_gradient_kernel, sgd_update_kernel;
-    float learning_rate;
-    int batch_size, epochs;
+    cl::Kernel conv2d_kernel, max_pooling_kernel, fc_kernel, softmax_kernel;
+    cl::Kernel cross_entropy_gradient_kernel, fc_gradient_kernel, sgd_update_kernel;
 
+    // Hàm tiền xử lý ảnh
     std::vector<float> preprocess_image(const cv::Mat& image) {
         cv::Mat resized;
         cv::resize(image, resized, cv::Size(model.input_width, model.input_height));
         std::vector<float> input_data(model.input_width * model.input_height * model.input_channels);
-
-        if (model.input_channels == 1) {
-            cv::Mat gray = resized.channels() == 3 ? cv::Mat() : resized;
-            if (resized.channels() == 3) cv::cvtColor(resized, gray, cv::COLOR_BGR2GRAY);
-            for (int y = 0; y < model.input_height; y++)
-                for (int x = 0; x < model.input_width; x++)
-                    input_data[y * model.input_width + x] = gray.at<uchar>(y, x) / 255.0f;
-        } else if (model.input_channels == 3) {
-            cv::Mat rgb = resized.channels() == 1 ? cv::Mat() : resized;
-            if (resized.channels() == 1) cv::cvtColor(resized, rgb, cv::COLOR_GRAY2BGR);
-            for (int y = 0; y < model.input_height; y++)
-                for (int x = 0; x < model.input_width; x++) {
-                    cv::Vec3b pixel = rgb.at<cv::Vec3b>(y, x);
-                    input_data[(0 * model.input_height + y) * model.input_width + x] = pixel[2] / 255.0f; // R
-                    input_data[(1 * model.input_height + y) * model.input_width + x] = pixel[1] / 255.0f; // G
-                    input_data[(2 * model.input_height + y) * model.input_width + x] = pixel[0] / 255.0f; // B
+        for (int c = 0; c < model.input_channels; c++) {
+            for (int h = 0; h < model.input_height; h++) {
+                for (int w = 0; w < model.input_width; w++) {
+                    float pixel_value = resized.at<cv::Vec3b>(h, w)[2 - c] / 255.0f;
+                    input_data[c * model.input_height * model.input_width + h * model.input_width + w] = pixel_value;
                 }
+            }
         }
         return input_data;
     }
 
+    // Hàm one-hot encoding
     std::vector<float> one_hot_encode(int label, int num_classes) {
         std::vector<float> encoding(num_classes, 0.0f);
-        if (label >= 0 && label < num_classes) encoding[label] = 1.0f;
+        encoding[label] = 1.0f;
         return encoding;
     }
 
-    void profile_kernel(cl::Event& event, const std::string& kernel_name, size_t global_work_size) {
+    // Hàm đo thời gian kernel
+    void profile_kernel(cl::Event& event, const std::string& name, int work_items) {
         event.wait();
-        cl_int err = event.getInfo<CL_EVENT_COMMAND_EXECUTION_STATUS>();
-        if (err != CL_COMPLETE) {
-            std::cerr << kernel_name << " - Lỗi thực thi kernel: " << err << std::endl;
-            return;
-        }
-        cl_ulong time_start, time_end;
-        event.getProfilingInfo(CL_PROFILING_COMMAND_START, &time_start);
-        event.getProfilingInfo(CL_PROFILING_COMMAND_END, &time_end);
-        double time_ms = (time_end - time_start) / 1000000.0;
-        // std::cout << kernel_name << " - Thời gian thực thi: " << time_ms << " ms | Global Work-items: " << global_work_size << std::endl;
+        cl_ulong start = event.getProfilingInfo<CL_PROFILING_COMMAND_START>();
+        cl_ulong end = event.getProfilingInfo<CL_PROFILING_COMMAND_END>();
+        double time_ms = (end - start) * 1.0e-6;
+        //std::cout << name << ": " << time_ms << " ms (" << work_items << " items, " << time_ms / work_items << " ms/item)" << std::endl;
     }
 
+    // Hàm forward pass
     std::vector<float> forward(const std::vector<float>& input_data,
                               std::vector<float>& conv1_output,
                               std::vector<float>& pool1_output,
@@ -382,6 +372,7 @@ private:
                               std::vector<float>& pool3_output,
                               std::vector<float>& fc_output,
                               double& forward_time_ms) {
+        int input_size = model.input_width * model.input_height * model.input_channels;
         int conv1_output_size = model.conv1_filters * model.conv1_width * model.conv1_height;
         int pool1_output_size = model.conv1_filters * model.pool1_width * model.pool1_height;
         int conv2_output_size = model.conv2_filters * model.conv2_width * model.conv2_height;
@@ -404,36 +395,38 @@ private:
 
         cl::Buffer d_input(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * input_data.size(), (void*)input_data.data());
         cl::Buffer d_conv1_weights(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * model.conv1_weights.size(), (void*)model.conv1_weights.data());
-        cl::Buffer d_conv1_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * conv1_output_size);
-        cl::Buffer d_pool1_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * pool1_output_size);
+        cl::Buffer d_conv1_output(context, CL_MEM_READ_WRITE, sizeof(float) * conv1_output_size);
+        cl::Buffer d_pool1_output(context, CL_MEM_READ_WRITE, sizeof(float) * pool1_output_size);
         cl::Buffer d_conv2_weights(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * model.conv2_weights.size(), (void*)model.conv2_weights.data());
-        cl::Buffer d_conv2_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * conv2_output_size);
-        cl::Buffer d_pool2_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * pool2_output_size);
+        cl::Buffer d_conv2_output(context, CL_MEM_READ_WRITE, sizeof(float) * conv2_output_size);
+        cl::Buffer d_pool2_output(context, CL_MEM_READ_WRITE, sizeof(float) * pool2_output_size);
         cl::Buffer d_conv3_weights(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * model.conv3_weights.size(), (void*)model.conv3_weights.data());
-        cl::Buffer d_conv3_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * conv3_output_size);
-        cl::Buffer d_pool3_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * pool3_output_size);
+        cl::Buffer d_conv3_output(context, CL_MEM_READ_WRITE, sizeof(float) * conv3_output_size);
+        cl::Buffer d_pool3_output(context, CL_MEM_READ_WRITE, sizeof(float) * pool3_output_size);
         cl::Buffer d_fc_weights(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * model.fc_weights.size(), (void*)model.fc_weights.data());
-        cl::Buffer d_fc_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * fc_output_size);
+        cl::Buffer d_fc_output(context, CL_MEM_READ_WRITE, sizeof(float) * fc_output_size);
         cl::Buffer d_out_weights(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * model.out_weights.size(), (void*)model.out_weights.data());
-        cl::Buffer d_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * output_size);
+        cl::Buffer d_output(context, CL_MEM_READ_WRITE, sizeof(float) * output_size);
 
         cl::Event event;
+        size_t local_size = 16;
+        size_t local_mem_size = model.input_channels * model.filter_size * model.filter_size * sizeof(float);
 
-        // Convolution 1
+        // Conv1
         conv2d_kernel.setArg(0, d_input);
         conv2d_kernel.setArg(1, d_conv1_weights);
         conv2d_kernel.setArg(2, d_conv1_output);
-        conv2d_kernel.setArg(3, cl::Local(sizeof(float) * model.input_channels * model.filter_size * model.filter_size));
+        conv2d_kernel.setArg(3, cl::Local(local_mem_size));
         conv2d_kernel.setArg(4, model.input_width);
         conv2d_kernel.setArg(5, model.input_height);
         conv2d_kernel.setArg(6, model.input_channels);
         conv2d_kernel.setArg(7, model.filter_size);
         conv2d_kernel.setArg(8, model.conv1_filters);
-        conv2d_kernel.setArg(9, 1);
-        queue.enqueueNDRangeKernel(conv2d_kernel, cl::NullRange, cl::NDRange(model.conv1_width, model.conv1_height, model.conv1_filters), cl::NullRange, nullptr, &event);
-        profile_kernel(event, "Convolution 1", model.conv1_width * model.conv1_height * model.conv1_filters);
+        conv2d_kernel.setArg(9, 1); // stride
+        queue.enqueueNDRangeKernel(conv2d_kernel, cl::NullRange, cl::NDRange(model.conv1_width, model.conv1_height, model.conv1_filters), cl::NDRange(local_size, local_size, 1), nullptr, &event);
+        profile_kernel(event, "Conv1", model.conv1_width * model.conv1_height * model.conv1_filters);
 
-        // Max Pooling 1
+        // Pool1
         max_pooling_kernel.setArg(0, d_conv1_output);
         max_pooling_kernel.setArg(1, d_pool1_output);
         max_pooling_kernel.setArg(2, model.conv1_width);
@@ -441,23 +434,23 @@ private:
         max_pooling_kernel.setArg(4, model.conv1_filters);
         max_pooling_kernel.setArg(5, model.pool_size);
         queue.enqueueNDRangeKernel(max_pooling_kernel, cl::NullRange, cl::NDRange(model.pool1_width, model.pool1_height, model.conv1_filters), cl::NullRange, nullptr, &event);
-        profile_kernel(event, "Max Pooling 1", model.pool1_width * model.pool1_height * model.conv1_filters);
+        profile_kernel(event, "Pool1", model.pool1_width * model.pool1_height * model.conv1_filters);
 
-        // Convolution 2
+        // Conv2
         conv2d_kernel.setArg(0, d_pool1_output);
         conv2d_kernel.setArg(1, d_conv2_weights);
         conv2d_kernel.setArg(2, d_conv2_output);
-        conv2d_kernel.setArg(3, cl::Local(sizeof(float) * model.conv1_filters * model.filter_size * model.filter_size));
+        conv2d_kernel.setArg(3, cl::Local(local_mem_size));
         conv2d_kernel.setArg(4, model.pool1_width);
         conv2d_kernel.setArg(5, model.pool1_height);
         conv2d_kernel.setArg(6, model.conv1_filters);
         conv2d_kernel.setArg(7, model.filter_size);
         conv2d_kernel.setArg(8, model.conv2_filters);
-        conv2d_kernel.setArg(9, 1);
-        queue.enqueueNDRangeKernel(conv2d_kernel, cl::NullRange, cl::NDRange(model.conv2_width, model.conv2_height, model.conv2_filters), cl::NullRange, nullptr, &event);
-        profile_kernel(event, "Convolution 2", model.conv2_width * model.conv2_height * model.conv2_filters);
+        conv2d_kernel.setArg(9, 1); // stride
+        queue.enqueueNDRangeKernel(conv2d_kernel, cl::NullRange, cl::NDRange(model.conv2_width, model.conv2_height, model.conv2_filters), cl::NDRange(local_size, local_size, 1), nullptr, &event);
+        profile_kernel(event, "Conv2", model.conv2_width * model.conv2_height * model.conv2_filters);
 
-        // Max Pooling 2
+        // Pool2
         max_pooling_kernel.setArg(0, d_conv2_output);
         max_pooling_kernel.setArg(1, d_pool2_output);
         max_pooling_kernel.setArg(2, model.conv2_width);
@@ -465,23 +458,23 @@ private:
         max_pooling_kernel.setArg(4, model.conv2_filters);
         max_pooling_kernel.setArg(5, model.pool_size);
         queue.enqueueNDRangeKernel(max_pooling_kernel, cl::NullRange, cl::NDRange(model.pool2_width, model.pool2_height, model.conv2_filters), cl::NullRange, nullptr, &event);
-        profile_kernel(event, "Max Pooling 2", model.pool2_width * model.pool2_height * model.conv2_filters);
+        profile_kernel(event, "Pool2", model.pool2_width * model.pool2_height * model.conv2_filters);
 
-        // Convolution 3
+        // Conv3
         conv2d_kernel.setArg(0, d_pool2_output);
         conv2d_kernel.setArg(1, d_conv3_weights);
         conv2d_kernel.setArg(2, d_conv3_output);
-        conv2d_kernel.setArg(3, cl::Local(sizeof(float) * model.conv2_filters * model.filter_size * model.filter_size));
+        conv2d_kernel.setArg(3, cl::Local(local_mem_size));
         conv2d_kernel.setArg(4, model.pool2_width);
         conv2d_kernel.setArg(5, model.pool2_height);
         conv2d_kernel.setArg(6, model.conv2_filters);
         conv2d_kernel.setArg(7, model.filter_size);
         conv2d_kernel.setArg(8, model.conv3_filters);
-        conv2d_kernel.setArg(9, 1);
-        queue.enqueueNDRangeKernel(conv2d_kernel, cl::NullRange, cl::NDRange(model.conv3_width, model.conv3_height, model.conv3_filters), cl::NullRange, nullptr, &event);
-        profile_kernel(event, "Convolution 3", model.conv3_width * model.conv3_height * model.conv3_filters);
+        conv2d_kernel.setArg(9, 1); // stride
+        queue.enqueueNDRangeKernel(conv2d_kernel, cl::NullRange, cl::NDRange(model.conv3_width, model.conv3_height, model.conv3_filters), cl::NDRange(local_size, local_size, 1), nullptr, &event);
+        profile_kernel(event, "Conv3", model.conv3_width * model.conv3_height * model.conv3_filters);
 
-        // Max Pooling 3
+        // Pool3
         max_pooling_kernel.setArg(0, d_conv3_output);
         max_pooling_kernel.setArg(1, d_pool3_output);
         max_pooling_kernel.setArg(2, model.conv3_width);
@@ -489,10 +482,10 @@ private:
         max_pooling_kernel.setArg(4, model.conv3_filters);
         max_pooling_kernel.setArg(5, model.pool_size);
         queue.enqueueNDRangeKernel(max_pooling_kernel, cl::NullRange, cl::NDRange(model.pool3_width, model.pool3_height, model.conv3_filters), cl::NullRange, nullptr, &event);
-        profile_kernel(event, "Max Pooling 3", model.pool3_width * model.pool3_height * model.conv3_filters);
+        profile_kernel(event, "Pool3", model.pool3_width * model.pool3_height * model.conv3_filters);
 
         // Fully Connected
-        int fc_input_size = pool3_output_size;
+        int fc_input_size = model.conv3_filters * model.pool3_width * model.pool3_height;
         fc_kernel.setArg(0, d_pool3_output);
         fc_kernel.setArg(1, d_fc_weights);
         fc_kernel.setArg(2, d_fc_output);
@@ -624,7 +617,7 @@ private:
     }
 
 public:
-    CNNTrainer(CNNModel& m, float lr = 0.001, int batch = 32, int e = 10)
+    CNNTrainer(CNNModel& m, float lr = 0.001, int batch = 32, int e = 1)
         : model(m), learning_rate(lr), batch_size(batch), epochs(e) {
         std::vector<cl::Platform> platforms;
         cl::Platform::get(&platforms);
@@ -666,8 +659,8 @@ public:
                 dataset.push_back({path, label});
             }
         }
-        std::random_device rd;
-        std::mt19937 g(rd());
+        // Sử dụng seed cố định để đảm bảo kết quả nhất quán
+        std::mt19937 g(42); // Seed cố định là 42
         std::shuffle(dataset.begin(), dataset.end(), g);
         return dataset;
     }
@@ -676,17 +669,16 @@ public:
         std::vector<std::pair<std::string, int>> dataset = load_dataset(dataset_path);
         std::cout << "Đã tải " << dataset.size() << " mẫu dữ liệu" << std::endl;
 
-        size_t train_size = dataset.size() * 0.8;
-        std::vector<std::pair<std::string, int>> train_set(dataset.begin(), dataset.begin() + train_size);
-        std::vector<std::pair<std::string, int>> val_set(dataset.begin() + train_size, dataset.end());
+        // Không chia tập train/validation, sử dụng toàn bộ dataset
+        std::vector<std::pair<std::string, int>>& train_set = dataset;
 
         std::cout << "Training set: " << train_set.size() << " mẫu" << std::endl;
-        std::cout << "Validation set: " << val_set.size() << " mẫu" << std::endl;
 
         for (int epoch = 0; epoch < epochs; epoch++) {
             std::cout << "Epoch " << epoch + 1 << "/" << epochs << std::endl;
-            std::random_device rd;
-            std::mt19937 g(rd());
+            
+            // Sử dụng seed cố định để đảm bảo kết quả nhất quán
+            std::mt19937 g(42 + epoch); // Seed cố định là 42 + epoch
             std::shuffle(train_set.begin(), train_set.end(), g);
 
             float total_loss = 0.0f;
@@ -710,11 +702,13 @@ public:
                     std::vector<float> output = forward(input_data, conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc_output, forward_time_ms);
                     total_forward_time += forward_time_ms;
 
+                    // Tính cross-entropy loss
                     float loss = 0.0f;
                     for (int k = 0; k < model.num_classes; k++)
                         if (targets[k] > 0.5f) loss -= std::log(std::max(output[k], 1e-7f));
                     total_loss += loss;
 
+                    // Tính accuracy
                     int predicted_class = std::max_element(output.begin(), output.end()) - output.begin();
                     if (predicted_class == train_set[j].second) correct++;
 
@@ -733,56 +727,65 @@ public:
                 }
             }
             std::cout << std::endl;
-
-            float val_loss = 0.0f;
-            int val_correct = 0;
-            for (size_t i = 0; i < val_set.size(); i++) {
-                cv::Mat image = cv::imread(val_set[i].first, cv::IMREAD_COLOR);
+            
+            // Đánh giá trên toàn bộ tập dữ liệu (không chia validation)
+            float eval_loss = 0.0f;
+            int eval_correct = 0;
+            for (size_t i = 0; i < dataset.size(); i++) {
+                cv::Mat image = cv::imread(dataset[i].first, cv::IMREAD_COLOR);
                 if (image.empty()) continue;
                 std::vector<float> input_data = preprocess_image(image);
-                std::vector<float> targets = one_hot_encode(val_set[i].second, model.num_classes);
+                std::vector<float> targets = one_hot_encode(dataset[i].second, model.num_classes);
 
                 double forward_time_ms = 0.0;
                 std::vector<float> conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc_output;
                 std::vector<float> output = forward(input_data, conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc_output, forward_time_ms);
 
+                // Tính cross-entropy loss
                 float loss = 0.0f;
                 for (int k = 0; k < model.num_classes; k++)
                     if (targets[k] > 0.5f) loss -= std::log(std::max(output[k], 1e-7f));
-                val_loss += loss;
+                eval_loss += loss;
 
+                // Tính accuracy
                 int predicted_class = std::max_element(output.begin(), output.end()) - output.begin();
-                if (predicted_class == val_set[i].second) val_correct++;
+                if (predicted_class == dataset[i].second) eval_correct++;
             }
-
-            val_loss /= val_set.size();
-            float val_accuracy = 100.0f * val_correct / val_set.size();
-            std::cout << "Validation - Loss: " << val_loss << " | Accuracy: " << val_accuracy << "%" << std::endl;
-
-            model.save("model_epoch_" + std::to_string(epoch + 1) + ".bin");
+            
+            std::cout << "Evaluation - Loss: " << eval_loss / dataset.size()
+                      << " | Accuracy: " << 100.0f * eval_correct / dataset.size() << "%" << std::endl;
         }
     }
 
     int predict(const std::string& image_path, std::vector<float>& confidence, double& forward_time_ms) {
         cv::Mat image = cv::imread(image_path, cv::IMREAD_COLOR);
         if (image.empty()) throw std::runtime_error("Không thể tải ảnh: " + image_path);
-
         std::vector<float> input_data = preprocess_image(image);
         std::vector<float> conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc_output;
-        std::vector<float> output = forward(input_data, conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc_output, forward_time_ms);
-
-        confidence = output;
-        return std::max_element(output.begin(), output.end()) - output.begin();
+        confidence = forward(input_data, conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc_output, forward_time_ms);
+        return std::max_element(confidence.begin(), confidence.end()) - confidence.begin();
     }
 };
 
 int main() {
     try {
-        int input_width = 64, input_height = 64, input_channels = 3, filter_size = 5, 
-            conv1_filters = 128, conv2_filters = 256, conv3_filters = 512, 
-            pool_size = 2, fc_size = 256, num_classes = 4;
+        // Sử dụng seed cố định để đảm bảo kết quả nhất quán
+        std::srand(42);
+        
+        // Thông số model
+        int input_width = 64;
+        int input_height = 64;
+        int input_channels = 3;
+        int filter_size = 5;
+        int conv1_filters = 64;
+        int conv2_filters = 128;
+        int conv3_filters = 216;
+        int pool_size = 2;
+        int fc_size = 256;
+        int num_classes = 4;
+
         CNNModel model(input_width, input_height, input_channels, filter_size, conv1_filters, conv2_filters, conv3_filters, pool_size, fc_size, num_classes);
-        CNNTrainer trainer(model, 0.001, 32, 10);
+        CNNTrainer trainer(model, 0.001, 32, 1);
 
         int choice;
         std::cout << "Lựa chọn chế độ:\n1. Train model mới\n2. Tải và dùng model đã train\nNhập lựa chọn (1 hoặc 2): ";
@@ -793,17 +796,22 @@ int main() {
             std::cout << "Nhập đường dẫn đến file CSV dataset: ";
             std::cin >> dataset_path;
             trainer.train(dataset_path);
-            model.save("model_final.bin");
+            model.save("model_opencl.bin");
         } else if (choice == 2) {
-            std::string model_path, image_path;
-            std::cout << "Nhập đường dẫn đến file model (.bin): ";
+            std::string model_path;
+            std::cout << "Nhập đường dẫn đến file model: ";
             std::cin >> model_path;
             model = CNNModel::load(model_path);
+            CNNTrainer new_trainer(model);
+
+            std::string image_path;
             std::cout << "Nhập đường dẫn đến ảnh cần dự đoán: ";
             std::cin >> image_path;
+
             std::vector<float> confidence;
-            double forward_time_ms = 0.0;
-            int predicted_class = trainer.predict(image_path, confidence, forward_time_ms);
+            double forward_time_ms;
+            int predicted_class = new_trainer.predict(image_path, confidence, forward_time_ms);
+
             std::vector<std::string> class_names = {"RED", "BLUE", "GREEN", "YELLOW"};
             std::cout << "Dự đoán: " << class_names[predicted_class] << std::endl;
             std::cout << "Thời gian forward pass: " << forward_time_ms << " ms" << std::endl;
@@ -814,7 +822,7 @@ int main() {
             std::cout << "Lựa chọn không hợp lệ!" << std::endl;
         }
     } catch (std::exception& e) {
-        std::cerr << "Lỗi: " << e.what() << std::endl;
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
     return 0;

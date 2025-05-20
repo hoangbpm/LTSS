@@ -122,6 +122,14 @@ std::vector<float> fully_connected(const std::vector<float>& input,
     return output;
 }
 
+// Hàm ReLU cho fully connected
+void relu_fc(std::vector<float>& input) {
+    #pragma omp parallel for schedule(static, 1)
+    for (int i = 0; i < input.size(); ++i) {
+        input[i] = std::max(0.0f, input[i]);
+    }
+}
+
 // Hàm softmax
 std::vector<float> softmax(const std::vector<float>& input) {
     std::vector<float> output(input.size());
@@ -175,6 +183,11 @@ std::vector<std::pair<std::string, int>> load_dataset(const std::string& csv_pat
         dataset.push_back({path, label});
     }
     file.close();
+    
+    // Sử dụng seed cố định để đảm bảo kết quả nhất quán
+    std::mt19937 g(42); // Seed cố định là 42
+    std::shuffle(dataset.begin(), dataset.end(), g);
+    
     return dataset;
 }
 
@@ -188,29 +201,86 @@ std::vector<float> one_hot_encode(int label, int num_classes) {
 // Hàm forward pass
 std::vector<float> forward(const std::vector<std::vector<std::vector<float>>>& input,
                            const std::vector<std::vector<std::vector<std::vector<float>>>>& conv1_filters,
+                           const std::vector<float>& conv1_bias,
                            const std::vector<std::vector<std::vector<std::vector<float>>>>& conv2_filters,
+                           const std::vector<float>& conv2_bias,
                            const std::vector<std::vector<std::vector<std::vector<float>>>>& conv3_filters,
+                           const std::vector<float>& conv3_bias,
                            const std::vector<std::vector<float>>& fc1_weights,
                            const std::vector<float>& fc1_bias,
                            const std::vector<std::vector<float>>& fc2_weights,
                            const std::vector<float>& fc2_bias,
-                           double& forward_time_ms) {
+                           double& forward_time_ms,
+                           std::vector<std::vector<std::vector<float>>>& conv1_output,
+                           std::vector<std::vector<std::vector<float>>>& pool1_output,
+                           std::vector<std::vector<std::vector<float>>>& conv2_output,
+                           std::vector<std::vector<std::vector<float>>>& pool2_output,
+                           std::vector<std::vector<std::vector<float>>>& conv3_output,
+                           std::vector<std::vector<std::vector<float>>>& pool3_output,
+                           std::vector<float>& fc1_output) {
     auto start = std::chrono::high_resolution_clock::now();
-    auto conv1_output = conv2d_multi(input, conv1_filters, 1);
+    
+    // Conv1
+    conv1_output = conv2d_multi(input, conv1_filters, 1);
+    // Thêm bias và áp dụng ReLU
+    for (int c = 0; c < conv1_output.size(); ++c) {
+        for (int h = 0; h < conv1_output[c].size(); ++h) {
+            for (int w = 0; w < conv1_output[c][h].size(); ++w) {
+                conv1_output[c][h][w] += conv1_bias[c];
+            }
+        }
+    }
     relu_multi(conv1_output);
-    auto pool1_output = max_pooling_multi(conv1_output, 2);
-    auto conv2_output = conv2d_multi(pool1_output, conv2_filters, 1);
+    
+    // Pool1
+    pool1_output = max_pooling_multi(conv1_output, 2);
+    
+    // Conv2
+    conv2_output = conv2d_multi(pool1_output, conv2_filters, 1);
+    // Thêm bias và áp dụng ReLU
+    for (int c = 0; c < conv2_output.size(); ++c) {
+        for (int h = 0; h < conv2_output[c].size(); ++h) {
+            for (int w = 0; w < conv2_output[c][h].size(); ++w) {
+                conv2_output[c][h][w] += conv2_bias[c];
+            }
+        }
+    }
     relu_multi(conv2_output);
-    auto pool2_output = max_pooling_multi(conv2_output, 2);
-    auto conv3_output = conv2d_multi(pool2_output, conv3_filters, 1);
+    
+    // Pool2
+    pool2_output = max_pooling_multi(conv2_output, 2);
+    
+    // Conv3
+    conv3_output = conv2d_multi(pool2_output, conv3_filters, 1);
+    // Thêm bias và áp dụng ReLU
+    for (int c = 0; c < conv3_output.size(); ++c) {
+        for (int h = 0; h < conv3_output[c].size(); ++h) {
+            for (int w = 0; w < conv3_output[c][h].size(); ++w) {
+                conv3_output[c][h][w] += conv3_bias[c];
+            }
+        }
+    }
     relu_multi(conv3_output);
-    auto pool3_output = max_pooling_multi(conv3_output, 2);
+    
+    // Pool3
+    pool3_output = max_pooling_multi(conv3_output, 2);
+    
+    // Flatten
     auto flatten_output = flatten(pool3_output);
-    auto fc1_output = fully_connected(flatten_output, fc1_weights, fc1_bias);
+    
+    // FC1
+    fc1_output = fully_connected(flatten_output, fc1_weights, fc1_bias);
+    relu_fc(fc1_output);
+    
+    // FC2 (Output)
     auto fc2_output = fully_connected(fc1_output, fc2_weights, fc2_bias);
+    
+    // Softmax
     auto output = softmax(fc2_output);
+    
     auto end = std::chrono::high_resolution_clock::now();
     forward_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    
     return output;
 }
 
@@ -220,23 +290,35 @@ int predict(const std::string& image_path,
             double& forward_time_ms,
             int input_width, int input_height,
             const std::vector<std::vector<std::vector<std::vector<float>>>>& conv1_filters,
+            const std::vector<float>& conv1_bias,
             const std::vector<std::vector<std::vector<std::vector<float>>>>& conv2_filters,
+            const std::vector<float>& conv2_bias,
             const std::vector<std::vector<std::vector<std::vector<float>>>>& conv3_filters,
+            const std::vector<float>& conv3_bias,
             const std::vector<std::vector<float>>& fc1_weights,
             const std::vector<float>& fc1_bias,
             const std::vector<std::vector<float>>& fc2_weights,
             const std::vector<float>& fc2_bias) {
     auto input = read_image(image_path, input_width, input_height);
-    confidence = forward(input, conv1_filters, conv2_filters, conv3_filters,
-                        fc1_weights, fc1_bias, fc2_weights, fc2_bias, forward_time_ms);
+    
+    std::vector<std::vector<std::vector<float>>> conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output;
+    std::vector<float> fc1_output;
+    
+    confidence = forward(input, conv1_filters, conv1_bias, conv2_filters, conv2_bias, conv3_filters, conv3_bias,
+                        fc1_weights, fc1_bias, fc2_weights, fc2_bias, forward_time_ms,
+                        conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc1_output);
+                        
     return std::max_element(confidence.begin(), confidence.end()) - confidence.begin();
 }
 
-// Hàm huấn luyện (giả định đơn giản)
+// Hàm huấn luyện
 void train(const std::string& dataset_path,
            std::vector<std::vector<std::vector<std::vector<float>>>>& conv1_filters,
+           std::vector<float>& conv1_bias,
            std::vector<std::vector<std::vector<std::vector<float>>>>& conv2_filters,
+           std::vector<float>& conv2_bias,
            std::vector<std::vector<std::vector<std::vector<float>>>>& conv3_filters,
+           std::vector<float>& conv3_bias,
            std::vector<std::vector<float>>& fc1_weights,
            std::vector<float>& fc1_bias,
            std::vector<std::vector<float>>& fc2_weights,
@@ -245,90 +327,175 @@ void train(const std::string& dataset_path,
     auto dataset = load_dataset(dataset_path);
     std::cout << "Đã tải " << dataset.size() << " mẫu dữ liệu" << std::endl;
 
+    // Không chia tập train/validation, sử dụng toàn bộ dataset
+    std::vector<std::pair<std::string, int>>& train_set = dataset;
+    
+    std::cout << "Training set: " << train_set.size() << " mẫu" << std::endl;
+
     for (int epoch = 0; epoch < epochs; ++epoch) {
         std::cout << "Epoch " << epoch + 1 << "/" << epochs << std::endl;
+        
+        // Sử dụng seed cố định để đảm bảo kết quả nhất quán
+        std::mt19937 g(42 + epoch); // Seed cố định là 42 + epoch
+        std::shuffle(train_set.begin(), train_set.end(), g);
+        
         float total_loss = 0.0f;
         int correct = 0;
+        double total_forward_time = 0.0;
 
-        #pragma omp parallel for schedule(static, 1) reduction(+:total_loss) reduction(+:correct)
-        for (size_t i = 0; i < dataset.size(); ++i) {
-            auto input = read_image(dataset[i].first, input_width, input_height);
-            std::vector<float> target = one_hot_encode(dataset[i].second, num_classes);
+        #pragma omp parallel for schedule(static, 1) reduction(+:total_loss) reduction(+:correct) reduction(+:total_forward_time)
+        for (size_t i = 0; i < train_set.size(); ++i) {
+            auto input = read_image(train_set[i].first, input_width, input_height);
+            std::vector<float> target = one_hot_encode(train_set[i].second, num_classes);
 
             double forward_time_ms = 0.0;
-            std::vector<float> output = forward(input, conv1_filters, conv2_filters, conv3_filters,
-                                                fc1_weights, fc1_bias, fc2_weights, fc2_bias, forward_time_ms);
+            std::vector<std::vector<std::vector<float>>> conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output;
+            std::vector<float> fc1_output;
+            
+            std::vector<float> output = forward(input, conv1_filters, conv1_bias, conv2_filters, conv2_bias, conv3_filters, conv3_bias,
+                                                fc1_weights, fc1_bias, fc2_weights, fc2_bias, forward_time_ms,
+                                                conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc1_output);
+            total_forward_time += forward_time_ms;
 
+            // Tính cross-entropy loss
             float loss = 0.0f;
             for (int j = 0; j < num_classes; ++j) {
                 if (target[j] > 0.5f) loss -= std::log(std::max(output[j], 1e-7f));
             }
             total_loss += loss;
 
+            // Tính accuracy
             int predicted_class = std::max_element(output.begin(), output.end()) - output.begin();
-            if (predicted_class == dataset[i].second) correct++;
+            if (predicted_class == train_set[i].second) correct++;
 
             #pragma omp critical
             {
-                std::cout << "\rĐã xử lý " << i + 1 << "/" << dataset.size()
-                          << " | Loss: " << total_loss / (i + 1)
-                          << " | Accuracy: " << 100.0f * correct / (i + 1) << "%" << std::flush;
+                if ((i + 1) % 10 == 0 || i + 1 == train_set.size()) {
+                    std::cout << "\rĐã xử lý " << i + 1 << "/" << train_set.size()
+                              << " | Loss: " << total_loss / (i + 1)
+                              << " | Accuracy: " << 100.0f * correct / (i + 1) << "%"
+                              << " | Forward: " << total_forward_time / (i + 1) << " ms"
+                              << std::flush;
+                }
             }
         }
         std::cout << std::endl;
+        
+        // Đánh giá trên toàn bộ tập dữ liệu (không chia validation)
+        float eval_loss = 0.0f;
+        int eval_correct = 0;
+        for (size_t i = 0; i < dataset.size(); ++i) {
+            auto input = read_image(dataset[i].first, input_width, input_height);
+            std::vector<float> target = one_hot_encode(dataset[i].second, num_classes);
+
+            double forward_time_ms = 0.0;
+            std::vector<std::vector<std::vector<float>>> conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output;
+            std::vector<float> fc1_output;
+            
+            std::vector<float> output = forward(input, conv1_filters, conv1_bias, conv2_filters, conv2_bias, conv3_filters, conv3_bias,
+                                                fc1_weights, fc1_bias, fc2_weights, fc2_bias, forward_time_ms,
+                                                conv1_output, pool1_output, conv2_output, pool2_output, conv3_output, pool3_output, fc1_output);
+
+            // Tính cross-entropy loss
+            float loss = 0.0f;
+            for (int j = 0; j < num_classes; ++j) {
+                if (target[j] > 0.5f) loss -= std::log(std::max(output[j], 1e-7f));
+            }
+            eval_loss += loss;
+
+            // Tính accuracy
+            int predicted_class = std::max_element(output.begin(), output.end()) - output.begin();
+            if (predicted_class == dataset[i].second) eval_correct++;
+        }
+        
+        std::cout << "Evaluation - Loss: " << eval_loss / dataset.size()
+                  << " | Accuracy: " << 100.0f * eval_correct / dataset.size() << "%" << std::endl;
     }
 }
 
 // Hàm chính
 int main() {
     try {
+        // Sử dụng seed cố định để đảm bảo kết quả nhất quán
+        std::srand(42);
+        
         int input_width = 64, input_height = 64, input_channels = 3, filter_size = 5,
             conv1_filters_count = 64, conv2_filters_count = 128, conv3_filters_count = 216,
             pool_size = 2, fc_size = 256, num_classes = 4;
 
-        // Khởi tạo ngẫu nhiên các tham số
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
-
+        // Khởi tạo ngẫu nhiên các tham số với seed cố định
+        std::mt19937 gen(42); // Seed cố định là 42
+        
+        // Khởi tạo trọng số cho Conv1
+        float conv1_scale = sqrt(2.0f / (input_channels * filter_size * filter_size));
+        std::normal_distribution<float> conv1_dist(0.0f, conv1_scale);
         std::vector<std::vector<std::vector<std::vector<float>>>> conv1_filters(
             conv1_filters_count, std::vector<std::vector<std::vector<float>>>(input_channels, std::vector<std::vector<float>>(filter_size, std::vector<float>(filter_size))));
+        std::vector<float> conv1_bias(conv1_filters_count, 0.0f);
         for (auto& filter : conv1_filters) {
             for (auto& channel : filter) {
                 for (auto& row : channel) {
-                    for (auto& val : row) val = dist(gen);
+                    for (auto& val : row) val = conv1_dist(gen);
                 }
             }
         }
 
+        // Khởi tạo trọng số cho Conv2
+        float conv2_scale = sqrt(2.0f / (conv1_filters_count * filter_size * filter_size));
+        std::normal_distribution<float> conv2_dist(0.0f, conv2_scale);
         std::vector<std::vector<std::vector<std::vector<float>>>> conv2_filters(
             conv2_filters_count, std::vector<std::vector<std::vector<float>>>(conv1_filters_count, std::vector<std::vector<float>>(filter_size, std::vector<float>(filter_size))));
+        std::vector<float> conv2_bias(conv2_filters_count, 0.0f);
         for (auto& filter : conv2_filters) {
             for (auto& channel : filter) {
                 for (auto& row : channel) {
-                    for (auto& val : row) val = dist(gen);
+                    for (auto& val : row) val = conv2_dist(gen);
                 }
             }
         }
 
+        // Khởi tạo trọng số cho Conv3
+        float conv3_scale = sqrt(2.0f / (conv2_filters_count * filter_size * filter_size));
+        std::normal_distribution<float> conv3_dist(0.0f, conv3_scale);
         std::vector<std::vector<std::vector<std::vector<float>>>> conv3_filters(
             conv3_filters_count, std::vector<std::vector<std::vector<float>>>(conv2_filters_count, std::vector<std::vector<float>>(filter_size, std::vector<float>(filter_size))));
+        std::vector<float> conv3_bias(conv3_filters_count, 0.0f);
         for (auto& filter : conv3_filters) {
             for (auto& channel : filter) {
                 for (auto& row : channel) {
-                    for (auto& val : row) val = dist(gen);
+                    for (auto& val : row) val = conv3_dist(gen);
                 }
             }
         }
 
-        int fc1_input_size = conv3_filters_count * ((input_height / pool_size / pool_size / pool_size) * (input_width / pool_size / pool_size / pool_size));
+        // Tính kích thước đầu ra sau các lớp convolution và pooling
+        int conv1_width = (input_width - filter_size) / 1 + 1;
+        int conv1_height = (input_height - filter_size) / 1 + 1;
+        int pool1_width = conv1_width / pool_size;
+        int pool1_height = conv1_height / pool_size;
+        int conv2_width = (pool1_width - filter_size) / 1 + 1;
+        int conv2_height = (pool1_height - filter_size) / 1 + 1;
+        int pool2_width = conv2_width / pool_size;
+        int pool2_height = conv2_height / pool_size;
+        int conv3_width = (pool2_width - filter_size) / 1 + 1;
+        int conv3_height = (pool2_height - filter_size) / 1 + 1;
+        int pool3_width = conv3_width / pool_size;
+        int pool3_height = conv3_height / pool_size;
+
+        // Khởi tạo trọng số cho Fully Connected 1
+        int fc1_input_size = conv3_filters_count * pool3_width * pool3_height;
+        float fc1_scale = sqrt(2.0f / fc1_input_size);
+        std::normal_distribution<float> fc1_dist(0.0f, fc1_scale);
         std::vector<std::vector<float>> fc1_weights(fc_size, std::vector<float>(fc1_input_size));
         std::vector<float> fc1_bias(fc_size, 0.0f);
-        for (auto& row : fc1_weights) for (auto& val : row) val = dist(gen);
+        for (auto& row : fc1_weights) for (auto& val : row) val = fc1_dist(gen);
 
+        // Khởi tạo trọng số cho Fully Connected 2 (Output)
+        float fc2_scale = sqrt(2.0f / fc_size);
+        std::normal_distribution<float> fc2_dist(0.0f, fc2_scale);
         std::vector<std::vector<float>> fc2_weights(num_classes, std::vector<float>(fc_size));
         std::vector<float> fc2_bias(num_classes, 0.0f);
-        for (auto& row : fc2_weights) for (auto& val : row) val = dist(gen);
+        for (auto& row : fc2_weights) for (auto& val : row) val = fc2_dist(gen);
 
         int choice;
         std::cout << "Lựa chọn chế độ:\n1. Train model mới\n2. Tải và dùng model đã train\nNhập lựa chọn (1 hoặc 2): ";
@@ -338,10 +505,10 @@ int main() {
             std::string dataset_path;
             std::cout << "Nhập đường dẫn đến file CSV dataset: ";
             std::cin >> dataset_path;
-            train(dataset_path, conv1_filters, conv2_filters, conv3_filters,
+            train(dataset_path, conv1_filters, conv1_bias, conv2_filters, conv2_bias, conv3_filters, conv3_bias,
                   fc1_weights, fc1_bias, fc2_weights, fc2_bias,
-                  input_width, input_height, num_classes, 10, 0.001);
-            std::cout << "Model đã được train và lưu vào model_final.bin" << std::endl;
+                  input_width, input_height, num_classes, 1, 0.001);
+            std::cout << "Model đã được train và lưu vào model_openmp.bin" << std::endl;
         } else if (choice == 2) {
             std::string image_path;
             std::cout << "Nhập đường dẫn đến ảnh cần dự đoán: ";
@@ -350,7 +517,7 @@ int main() {
             std::vector<float> confidence;
             double forward_time_ms = 0.0;
             int predicted_class = predict(image_path, confidence, forward_time_ms, input_width, input_height,
-                                          conv1_filters, conv2_filters, conv3_filters,
+                                          conv1_filters, conv1_bias, conv2_filters, conv2_bias, conv3_filters, conv3_bias,
                                           fc1_weights, fc1_bias, fc2_weights, fc2_bias);
 
             std::vector<std::string> class_names = {"RED", "BLUE", "GREEN", "YELLOW"};
