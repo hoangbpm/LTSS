@@ -10,6 +10,13 @@
 #include <opencv2/opencv.hpp>
 #include <omp.h>
 
+// =============================
+//  MÔ HÌNH CNN SỬ DỤNG OPENMP
+//  (Song song hóa bằng OpenMP)
+//  Mô tả: Triển khai CNN cơ bản cho phân loại ảnh, sử dụng OpenCV để đọc ảnh và OpenMP để tăng tốc các phép toán.
+//  Đã chú thích chi tiết các hàm và biến bên dưới.
+// =============================
+
 // Hàm convolution 2D cho đa kênh với OpenMP
 std::vector<std::vector<std::vector<float>>> conv2d_multi(
     const std::vector<std::vector<std::vector<float>>>& input,

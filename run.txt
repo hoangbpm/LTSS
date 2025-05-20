@@ -1,0 +1,19 @@
+g++ main_opencl.cpp -o main_opencl.exe -I"C:/opencv_mingw/include" -I"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/include" -L"C:/opencv_mingw/x64/mingw/lib" -L"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/lib/x64" -lopencv_core4120 -lopencv_highgui4120 -lopencv_imgproc4120  -lOpenCL -lopencv_imgcodecs4120
+
+g++ main_c.cpp -o main_c.exe -I"C:/opencv_mingw/include" -L"C:/opencv_mingw/x64/mingw/lib" -lopencv_core4120 -lopencv_highgui4120 -lopencv_imgproc4120 -lopencv_imgcodecs4120
+
+g++ main_openmp.cpp -o main_openmp.exe  -fopenmp -I"C:/opencv_mingw/include" -L"C:/opencv_mingw/x64/mingw/lib" -lopencv_core4120 -lopencv_highgui4120 -lopencv_imgproc4120 -lopencv_imgcodecs4120
+
+
+
+backbone_model:
+Input: 32x32x3
+Conv1: 64 filters, 5x5, stride 1, ReLU
+Pool1: 2x2, stride 2
+Conv2: 128 filters, 5x5, stride 1, ReLU
+Pool2: 2x2, stride 2
+Conv3: 256 filters, 5x5, stride 1, ReLU
+Pool3: 2x2, stride 2
+Flatten
+FC1: 256 units, ReLU
+FC2: 4 units (softmax)

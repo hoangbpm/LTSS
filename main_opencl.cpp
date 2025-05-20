@@ -10,6 +10,13 @@
 #include <cmath>
 #include <opencv2/opencv.hpp>
 
+// =============================
+//  MÔ HÌNH CNN SỬ DỤNG OPENCL
+//  (Tăng tốc bằng GPU/OpenCL)
+//  Mô tả: Triển khai CNN cơ bản cho phân loại ảnh, sử dụng OpenCV để đọc ảnh và OpenCL để tăng tốc các phép toán trên GPU.
+//  Đã chú thích chi tiết các hàm và biến bên dưới.
+// =============================
+
 // Kernel OpenCL cho CNN với 3 lớp convolution
 const std::string kernel_source = R"(
     __kernel void conv2d(__global const float* input,

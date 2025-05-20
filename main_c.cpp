@@ -9,6 +9,13 @@
 #include <random>
 #include <opencv2/opencv.hpp>
 
+// =============================
+//  MÔ HÌNH CNN THUẦN C++
+//  (Không song song, không tăng tốc)
+//  Mô tả: Triển khai CNN cơ bản cho phân loại ảnh, sử dụng OpenCV để đọc ảnh.
+//  Đã chú thích chi tiết các hàm và biến bên dưới.
+// =============================
+
 // Hàm convolution 2D cho đa kênh
 std::vector<std::vector<std::vector<float>>> conv2d_multi(
     const std::vector<std::vector<std::vector<float>>>& input,
